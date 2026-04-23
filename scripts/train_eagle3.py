@@ -331,6 +331,11 @@ def build_target_model(
                 trust_remote_code=args.trust_remote_code,
             )
 
+        if isinstance(target_model, nn.Module):
+            # The online target model only provides hidden states/logits for data generation.
+            # Keep it frozen and outside FSDP state to avoid duplicating its parameters.
+            target_model.requires_grad_(False)
+
         # set the aux hidden states layers
         # VLM models use QwenVLOnlineEagle3Model which has its own hidden state
         # extraction in _prepare_data(), so we skip this call for VLM models
@@ -451,6 +456,8 @@ def build_dataloaders(
         f"{args.chat_template}-"
         f"{args.target_model_path}"  # Tokenizer may also different
     )
+    if args.is_vlm:
+        cache_params_string += "-vlm-mm-token-type-v1"
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
     train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
     is_online = (
@@ -591,6 +598,7 @@ def run_forward(
             input_ids=data["input_ids"].cuda(),
             attention_mask=data["attention_mask"].cuda(),
             loss_mask=data["loss_mask"].cuda(),
+            mm_token_type_ids=data["mm_token_type_ids"].cuda(),
             pixel_values=data["pixel_values"].cuda(),
             image_grid_thw=data["image_grid_thw"].cuda(),
         )
@@ -837,6 +845,9 @@ def main():
                 length=args.ttt_length,
                 attention_backend=args.attention_backend,
             )
+    fsdp_ignored_modules = (
+        [target_model] if is_online and isinstance(target_model, nn.Module) else None
+    )
     eagle3_model = FSDP(
         eagle3_model,
         use_orig_params=True,
@@ -846,6 +857,7 @@ def main():
         ),
         sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
         process_group=dist.group.WORLD,  # the draft model should run dp for all processes
+        ignored_modules=fsdp_ignored_modules,
     )
     print_with_rank("Initialized Eagle3 FSDP model")
 

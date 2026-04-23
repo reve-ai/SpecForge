@@ -291,6 +291,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        mm_token_type_ids: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
         pixel_values_videos: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
@@ -327,6 +328,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         target_kwargs = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
+            "mm_token_type_ids": mm_token_type_ids,
             "pixel_values": pixel_values,
             "pixel_values_videos": pixel_values_videos,
             "image_grid_thw": image_grid_thw,
@@ -442,6 +444,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         loss_mask: torch.Tensor,
         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         position_ids: Optional[torch.Tensor] = None,
+        mm_token_type_ids: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
         pixel_values_videos: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
@@ -468,6 +471,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
+            mm_token_type_ids=mm_token_type_ids,
             pixel_values=pixel_values,
             pixel_values_videos=pixel_values_videos,
             image_grid_thw=image_grid_thw,
@@ -519,6 +523,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 "attention_mask": base_attention_mask,
             }
             if self.target_model_type in {"qwen3_vl", "qwen3_vl_moe"}:
+                get_rope_kwargs["mm_token_type_ids"] = mm_token_type_ids
                 get_rope_kwargs["video_grid_thw"] = video_grid_thw
             else:
                 get_rope_kwargs["video_grid_thw"] = video_grid_thw
@@ -664,6 +669,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                     "attention_mask": next_attention_tensor,
                 }
                 if self.target_model_type in {"qwen3_vl", "qwen3_vl_moe"}:
+                    rope_kwargs["mm_token_type_ids"] = mm_token_type_ids
                     rope_kwargs["video_grid_thw"] = video_grid_thw
                 else:
                     rope_kwargs["video_grid_thw"] = video_grid_thw

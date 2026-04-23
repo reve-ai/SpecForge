@@ -204,6 +204,7 @@ def preprocess_vlm_conversations(
         "input_ids": [],
         "loss_mask": [],
         "attention_mask": [],
+        "mm_token_type_ids": [],
         "pixel_values": [],
         "image_grid_thw": [],
     }
@@ -267,6 +268,7 @@ def preprocess_vlm_conversations(
         )
         input_ids = encoding.input_ids[0]
         offsets = encoding.offset_mapping[0]
+        mm_token_type_ids = encoding.mm_token_type_ids[0]
         pixel_values = encoding.pixel_values
         image_grid_thw = encoding.image_grid_thw[0]
 
@@ -283,6 +285,7 @@ def preprocess_vlm_conversations(
         results["input_ids"].append(input_ids[None, :])
         results["loss_mask"].append(loss_mask[None, :])
         results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
+        results["mm_token_type_ids"].append(mm_token_type_ids[None, :])
         results["pixel_values"].append(pixel_values)
         results["image_grid_thw"].append(image_grid_thw[None, :])
     return results
