@@ -29,8 +29,9 @@ dependencies = [
     "yunchang",
 ]
 
-[tool.setuptools]
-packages = ["specforge"]
+[tool.setuptools.packages.find]
+include = ["specforge*"]
+exclude = ["configs*", "scripts*", "tests*"]
 
 [project.optional-dependencies]
 dev = [
