@@ -38,6 +38,63 @@ from specforge.distributed import (
 from specforge.modeling.draft import Eagle3DraftModel
 from specforge.utils import padding
 
+# One-shot diagnostic for the transformers>=5.6 get_rope_index contract.
+# 5.6 builds M-RoPE position ids per row by grouping mm_token_type_ids (after
+# attention_mask filtering) into text/image segments, and requires
+# sum(segment position counts) == unmasked token count, with image segments
+# lining up with image_grid_thw. Eagle3's packed/multi-image batches can break
+# that -> empty row (torch.cat([])) or scatter count mismatch. Dump the actual
+# per-row counts so the failing invariant is visible. Remove once diagnosed.
+_ROPE_DEBUG_SEEN: dict = {}
+
+
+def _debug_dump_rope_inputs(label, kwargs, model, max_dumps: int = 4):
+    try:
+        import torch.distributed as _d
+
+        if _d.is_available() and _d.is_initialized() and _d.get_rank() != 0:
+            return
+    except Exception:
+        pass
+    if _ROPE_DEBUG_SEEN.get(label, 0) >= max_dumps:
+        return
+    _ROPE_DEBUG_SEEN[label] = _ROPE_DEBUG_SEEN.get(label, 0) + 1
+
+    input_ids = kwargs.get("input_ids")
+    attn = kwargs.get("attention_mask")
+    mmtt = kwargs.get("mm_token_type_ids")
+    igt = kwargs.get("image_grid_thw")
+    cfg = model.config
+    image_token_id = getattr(cfg, "image_token_id", None)
+    merge = getattr(getattr(cfg, "vision_config", None), "spatial_merge_size", None)
+
+    lines = [
+        f"[ROPE-DEBUG {label}] input_ids={tuple(input_ids.shape)} "
+        f"image_token_id={image_token_id} merge={merge} "
+        f"attn={'None' if attn is None else tuple(attn.shape)} "
+        f"mm_token_type_ids={'None' if mmtt is None else tuple(mmtt.shape)}"
+    ]
+    for b in range(input_ids.shape[0]):
+        row = input_ids[b]
+        unmasked = int(attn[b].bool().sum()) if attn is not None else int(row.numel())
+        n_img = int((row == image_token_id).sum()) if image_token_id is not None else -1
+        n_mm1 = int((mmtt[b] == 1).sum()) if mmtt is not None else -1
+        lines.append(
+            f"  row {b}: seq={row.numel()} unmasked={unmasked} "
+            f"img_placeholder={n_img} mm_type==image={n_mm1}"
+        )
+    if igt is not None and merge:
+        implied, total = [], 0
+        for g in igt.tolist():
+            t, h, w = g[0], g[1], g[2]
+            n = t * (h // merge) * (w // merge)
+            implied.append((tuple(g), n))
+            total += n
+        lines.append(
+            f"  image_grid_thw -> implied vision tokens: {implied} total={total}"
+        )
+    print("\n".join(lines), flush=True)
+
 
 class Eagle3Model(nn.Module):
     pass
@@ -577,6 +634,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             else:
                 get_rope_kwargs["video_grid_thw"] = video_grid_thw
                 get_rope_kwargs["second_per_grid_ts"] = second_per_grid_ts
+            _debug_dump_rope_inputs("setup", get_rope_kwargs, self.target_model.model)
             position_ids, rope_deltas = self.target_model.model.get_rope_index(
                 **get_rope_kwargs
             )
@@ -725,6 +783,9 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 else:
                     rope_kwargs["video_grid_thw"] = video_grid_thw
                     rope_kwargs["second_per_grid_ts"] = second_per_grid_ts
+                _debug_dump_rope_inputs(
+                    f"ttt idx={idx}", rope_kwargs, self.target_model.model
+                )
                 position_ids, rope_deltas = self.target_model.model.get_rope_index(
                     **rope_kwargs
                 )
