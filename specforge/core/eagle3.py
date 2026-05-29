@@ -357,6 +357,20 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         if device is None:
             device = input_ids.device
 
+        # transformers >=5.6 Qwen3-VL computes M-RoPE inside the target model's
+        # own forward (compute_3d_position_ids) and requires mm_token_type_ids
+        # whenever image/video grids are passed -- not just our get_rope_index
+        # call below. The data pipeline does not produce it, so derive it here
+        # when absent. No-op on transformers that don't accept it:
+        # _resolve_get_rope_kwargs returns {} via signature introspection, so
+        # mm_token_type_ids stays None and is filtered out below.
+        if mm_token_type_ids is None and (
+            image_grid_thw is not None or video_grid_thw is not None
+        ):
+            mm_token_type_ids = self._resolve_get_rope_kwargs(input_ids, None).get(
+                "mm_token_type_ids"
+            )
+
         # run the target model to get the hidden states
         target_kwargs = {
             "input_ids": input_ids,
