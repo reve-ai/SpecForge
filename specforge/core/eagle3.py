@@ -147,6 +147,38 @@ def _reconcile_image_grids(kwargs, model):
         kwargs["image_grid_thw"] = igt[idx] if keep else igt[:0]
 
 
+def _ensure_nonempty_rope_rows(kwargs):
+    """Give every fully attention-masked row one unmasked text token before get_rope_index.
+
+    transformers >=5.6 get_rope_index builds per-row position ids by grouping the
+    attention-unmasked tokens of each row, then torch.cat's the per-row lists. A row
+    with zero unmasked tokens yields an empty list -> "torch.cat(): expected a non-empty
+    list of Tensors". The reve use_dummy_input_ids row (a single image token) survives
+    the setup pass but is shifted out by the TTT left-shift, leaving an all-padding row.
+    Unmask position 0 and mark it text so the row contributes one length-1 text segment;
+    its position ids are unused downstream (the row is loss-masked). No-op when the
+    attention_mask is absent, not 2D, or has no fully-masked row. Clones before mutating
+    so the caller's tensors are untouched.
+    """
+    attn = kwargs.get("attention_mask")
+    if attn is None or attn.dim() != 2:
+        return
+    fully_masked = attn.bool().sum(dim=1) == 0
+    if not bool(fully_masked.any()):
+        return
+    attn = attn.clone()
+    mmtt = kwargs.get("mm_token_type_ids")
+    if mmtt is not None:
+        mmtt = mmtt.clone()
+    for b in torch.nonzero(fully_masked, as_tuple=False).flatten().tolist():
+        attn[b, 0] = 1
+        if mmtt is not None:
+            mmtt[b, 0] = 0
+    kwargs["attention_mask"] = attn
+    if mmtt is not None:
+        kwargs["mm_token_type_ids"] = mmtt
+
+
 class Eagle3Model(nn.Module):
     pass
 
@@ -687,6 +719,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 get_rope_kwargs["second_per_grid_ts"] = second_per_grid_ts
             _debug_dump_rope_inputs("setup", get_rope_kwargs, self.target_model.model)
             _reconcile_image_grids(get_rope_kwargs, self.target_model.model)
+            _ensure_nonempty_rope_rows(get_rope_kwargs)
             position_ids, rope_deltas = self.target_model.model.get_rope_index(
                 **get_rope_kwargs
             )
@@ -839,6 +872,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                     f"ttt idx={idx}", rope_kwargs, self.target_model.model
                 )
                 _reconcile_image_grids(rope_kwargs, self.target_model.model)
+                _ensure_nonempty_rope_rows(rope_kwargs)
                 position_ids, rope_deltas = self.target_model.model.get_rope_index(
                     **rope_kwargs
                 )
