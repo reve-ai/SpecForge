@@ -20,6 +20,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 from typing import List, Optional, Tuple
 
 import torch
@@ -284,6 +285,38 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             model_type = getattr(target_config, "model_type", None)
         self.target_model_type = model_type
         self.rope_deltas: Optional[torch.Tensor] = None
+        self._target_get_rope_index_params: Optional[set] = None
+
+    def _resolve_get_rope_kwargs(
+        self,
+        input_ids: torch.Tensor,
+        mm_token_type_ids: Optional[torch.Tensor],
+    ) -> dict:
+        # Qwen3-VL transformers >=5.6 added `mm_token_type_ids` as a required kwarg
+        # to get_rope_index; older versions (e.g. 4.57.1) reject it.
+        # Detect once via signature introspection, then derive from input_ids
+        # when the caller didn't pass an explicit tensor.
+        if self._target_get_rope_index_params is None:
+            self._target_get_rope_index_params = set(
+                inspect.signature(self.target_model.model.get_rope_index).parameters
+            )
+        if "mm_token_type_ids" not in self._target_get_rope_index_params:
+            return {}
+        if mm_token_type_ids is None:
+            mm_token_type_ids = self._derive_mm_token_type_ids(input_ids)
+        return {"mm_token_type_ids": mm_token_type_ids}
+
+    def _derive_mm_token_type_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # Qwen3-VL's mm_token_type_ids: 0=text, 1=image, 2=video.
+        config = self.target_model.model.config
+        out = torch.zeros_like(input_ids, dtype=torch.int32)
+        image_token_id = getattr(config, "image_token_id", None)
+        video_token_id = getattr(config, "video_token_id", None)
+        if image_token_id is not None:
+            out[input_ids == image_token_id] = 1
+        if video_token_id is not None:
+            out[input_ids == video_token_id] = 2
+        return out
 
     @torch.no_grad()
     def _prepare_data(
@@ -291,6 +324,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        mm_token_type_ids: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
         pixel_values_videos: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
@@ -327,6 +361,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         target_kwargs = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
+            "mm_token_type_ids": mm_token_type_ids,
             "pixel_values": pixel_values,
             "pixel_values_videos": pixel_values_videos,
             "image_grid_thw": image_grid_thw,
@@ -442,6 +477,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         loss_mask: torch.Tensor,
         past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         position_ids: Optional[torch.Tensor] = None,
+        mm_token_type_ids: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
         pixel_values_videos: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
@@ -468,6 +504,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
+            mm_token_type_ids=mm_token_type_ids,
             pixel_values=pixel_values,
             pixel_values_videos=pixel_values_videos,
             image_grid_thw=image_grid_thw,
@@ -520,6 +557,9 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             }
             if self.target_model_type in {"qwen3_vl", "qwen3_vl_moe"}:
                 get_rope_kwargs["video_grid_thw"] = video_grid_thw
+                get_rope_kwargs.update(
+                    self._resolve_get_rope_kwargs(input_ids, mm_token_type_ids)
+                )
             else:
                 get_rope_kwargs["video_grid_thw"] = video_grid_thw
                 get_rope_kwargs["second_per_grid_ts"] = second_per_grid_ts
@@ -665,6 +705,9 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 }
                 if self.target_model_type in {"qwen3_vl", "qwen3_vl_moe"}:
                     rope_kwargs["video_grid_thw"] = video_grid_thw
+                    rope_kwargs.update(
+                        self._resolve_get_rope_kwargs(input_ids, mm_token_type_ids)
+                    )
                 else:
                     rope_kwargs["video_grid_thw"] = video_grid_thw
                     rope_kwargs["second_per_grid_ts"] = second_per_grid_ts

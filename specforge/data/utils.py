@@ -113,6 +113,13 @@ class DataCollatorWithPadding:
             "hidden_state": None,
             "target": None,
         }
+        if all("mm_token_type_ids" in item for item in features):
+            batch["mm_token_type_ids"] = torch.cat(
+                [
+                    self.paddingtensor2D(item["mm_token_type_ids"], max_length)
+                    for item in features
+                ]
+            )
         if all("hidden_state" in item for item in features):
             assert all(
                 "target" in item for item in features
@@ -194,6 +201,12 @@ class VlmDataCollatorWithPadding:
                 for item in features
             ]
         )
+        batch_mm_token_type_ids = torch.cat(
+            [
+                self.paddingtensor2D(item["mm_token_type_ids"], max_length)
+                for item in features
+            ]
+        )
         batch_loss_mask = torch.cat(
             [self.paddingtensor2D(item["loss_mask"], max_length) for item in features]
         )
@@ -206,6 +219,7 @@ class VlmDataCollatorWithPadding:
         batch = {
             "input_ids": batch_input_ids,
             "attention_mask": batch_attention_mask,
+            "mm_token_type_ids": batch_mm_token_type_ids,
             "loss_mask": batch_loss_mask,
             "pixel_values": batch_pixel_values,
             "image_grid_thw": batch_image_grid_thw,
