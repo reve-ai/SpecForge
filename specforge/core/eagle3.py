@@ -38,145 +38,27 @@ from specforge.distributed import (
 from specforge.modeling.draft import Eagle3DraftModel
 from specforge.utils import padding
 
-# One-shot diagnostic for the transformers>=5.6 get_rope_index contract.
-# 5.6 builds M-RoPE position ids per row by grouping mm_token_type_ids (after
-# attention_mask filtering) into text/image segments, and requires
-# sum(segment position counts) == unmasked token count, with image segments
-# lining up with image_grid_thw. Eagle3's packed/multi-image batches can break
-# that -> empty row (torch.cat([])) or scatter count mismatch. Dump the actual
-# per-row counts so the failing invariant is visible. Remove once diagnosed.
-_ROPE_DEBUG_SEEN: dict = {}
 
-
-def _debug_dump_rope_inputs(label, kwargs, model, max_dumps: int = 4):
-    try:
-        import torch.distributed as _d
-
-        if _d.is_available() and _d.is_initialized() and _d.get_rank() != 0:
-            return
-    except Exception:
-        pass
-    if _ROPE_DEBUG_SEEN.get(label, 0) >= max_dumps:
-        return
-    _ROPE_DEBUG_SEEN[label] = _ROPE_DEBUG_SEEN.get(label, 0) + 1
-
-    input_ids = kwargs.get("input_ids")
-    attn = kwargs.get("attention_mask")
-    mmtt = kwargs.get("mm_token_type_ids")
-    igt = kwargs.get("image_grid_thw")
-    cfg = model.config
-    image_token_id = getattr(cfg, "image_token_id", None)
-    merge = getattr(getattr(cfg, "vision_config", None), "spatial_merge_size", None)
-
-    lines = [
-        f"[ROPE-DEBUG {label}] input_ids={tuple(input_ids.shape)} "
-        f"image_token_id={image_token_id} merge={merge} "
-        f"attn={'None' if attn is None else tuple(attn.shape)} "
-        f"mm_token_type_ids={'None' if mmtt is None else tuple(mmtt.shape)}"
-    ]
-    for b in range(input_ids.shape[0]):
-        row = input_ids[b]
-        unmasked = int(attn[b].bool().sum()) if attn is not None else int(row.numel())
-        n_img = int((row == image_token_id).sum()) if image_token_id is not None else -1
-        n_mm1 = int((mmtt[b] == 1).sum()) if mmtt is not None else -1
-        lines.append(
-            f"  row {b}: seq={row.numel()} unmasked={unmasked} "
-            f"img_placeholder={n_img} mm_type==image={n_mm1}"
-        )
-    if igt is not None and merge:
-        implied, total = [], 0
-        for g in igt.tolist():
-            t, h, w = g[0], g[1], g[2]
-            n = t * (h // merge) * (w // merge)
-            implied.append((tuple(g), n))
-            total += n
-        lines.append(
-            f"  image_grid_thw -> implied vision tokens: {implied} total={total}"
-        )
-    print("\n".join(lines), flush=True)
-
-
-def _reconcile_image_grids(kwargs, model):
-    """Drop image_grid_thw entries with no matching live image-token segment.
-
-    transformers >=5.6 get_rope_index consumes image_grid_thw via a single global
-    iterator over image segments (runs of mm_token_type_ids==image, after
-    attention_mask filtering). The reve use_dummy_input_ids collate prepends a phantom
-    "image" (grid (1,2,2)) whose placeholder is not a live image_token_id in the
-    masked sequence, so its grid has no segment and desyncs the iterator -- the next
-    real image pulls the dummy grid and the position count mismatches the token count.
-    Keep only grids whose implied vision-token count matches the next live image
-    segment, in row order; drop orphans (the dummy). No-op on transformers that don't
-    use mm_token_type_ids (kwargs lacks it) or when nothing is dropped. Video grids are
-    left untouched (this data is image-only).
-    """
-    igt = kwargs.get("image_grid_thw")
-    mmtt = kwargs.get("mm_token_type_ids")
-    if igt is None or mmtt is None or igt.shape[0] == 0:
-        return
-    merge = getattr(
-        getattr(model.config, "vision_config", None), "spatial_merge_size", None
-    )
-    if not merge:
-        return
-    attn = kwargs.get("attention_mask")
-    seg_lens = []
-    for b in range(mmtt.shape[0]):
-        tt = mmtt[b]
-        if attn is not None:
-            tt = tt[attn[b].bool()]
-        tt = tt.tolist()
-        i, n = 0, len(tt)
-        while i < n:
-            if tt[i] == 1:
-                j = i
-                while j < n and tt[j] == 1:
-                    j += 1
-                seg_lens.append(j - i)
-                i = j
-            else:
-                i += 1
-    keep, seg_i = [], 0
-    for gi, g in enumerate(igt.tolist()):
-        implied = g[0] * (g[1] // merge) * (g[2] // merge)
-        if seg_i < len(seg_lens) and seg_lens[seg_i] == implied:
-            keep.append(gi)
-            seg_i += 1
-    if len(keep) != igt.shape[0]:
-        idx = torch.tensor(keep, dtype=torch.long, device=igt.device)
-        kwargs["image_grid_thw"] = igt[idx] if keep else igt[:0]
-
-
-def _ensure_nonempty_rope_rows(kwargs):
-    """Give every fully attention-masked row one unmasked text token before get_rope_index.
+def _assert_no_empty_rope_rows(kwargs):
+    """Assert no row reaches get_rope_index with zero attention-unmasked tokens.
 
     transformers >=5.6 get_rope_index builds per-row position ids by grouping the
-    attention-unmasked tokens of each row, then torch.cat's the per-row lists. A row
-    with zero unmasked tokens yields an empty list -> "torch.cat(): expected a non-empty
-    list of Tensors". The reve use_dummy_input_ids row (a single image token) survives
-    the setup pass but is shifted out by the TTT left-shift, leaving an all-padding row.
-    Unmask position 0 and mark it text so the row contributes one length-1 text segment;
-    its position ids are unused downstream (the row is loss-masked). No-op when the
-    attention_mask is absent, not 2D, or has no fully-masked row. Clones before mutating
-    so the caller's tensors are untouched.
+    attention-unmasked tokens of each row, then torch.cat's the per-row lists -- a row
+    with zero unmasked tokens yields an empty list ("torch.cat(): expected a non-empty
+    list of Tensors"). With use_dummy_input_ids disabled this can only happen if a real
+    packed row has <= TTT length tokens and is emptied by the TTT left-shift, which is
+    impossible for layout/editing data. Fail fast and loud if it ever occurs rather than
+    silently patching it. See PLAN_eagle3_remove_dummy.md.
     """
     attn = kwargs.get("attention_mask")
     if attn is None or attn.dim() != 2:
         return
-    fully_masked = attn.bool().sum(dim=1) == 0
-    if not bool(fully_masked.any()):
-        return
-    attn = attn.clone()
-    mmtt = kwargs.get("mm_token_type_ids")
-    if mmtt is not None:
-        mmtt = mmtt.clone()
-    for b in torch.nonzero(fully_masked, as_tuple=False).flatten().tolist():
-        attn[b, 0] = 1
-        if mmtt is not None:
-            mmtt[b, 0] = 0
-    kwargs["attention_mask"] = attn
-    if mmtt is not None:
-        kwargs["mm_token_type_ids"] = mmtt
+    empty_rows = int((attn.bool().sum(dim=1) == 0).sum())
+    assert empty_rows == 0, (
+        f"get_rope_index received {empty_rows} fully attention-masked row(s); a packed "
+        "row was emptied (sample shorter than the TTT unroll, or a stray dummy row). "
+        "See PLAN_eagle3_remove_dummy.md."
+    )
 
 
 class Eagle3Model(nn.Module):
@@ -717,9 +599,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             else:
                 get_rope_kwargs["video_grid_thw"] = video_grid_thw
                 get_rope_kwargs["second_per_grid_ts"] = second_per_grid_ts
-            _debug_dump_rope_inputs("setup", get_rope_kwargs, self.target_model.model)
-            _reconcile_image_grids(get_rope_kwargs, self.target_model.model)
-            _ensure_nonempty_rope_rows(get_rope_kwargs)
+            _assert_no_empty_rope_rows(get_rope_kwargs)
             position_ids, rope_deltas = self.target_model.model.get_rope_index(
                 **get_rope_kwargs
             )
@@ -868,11 +748,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 else:
                     rope_kwargs["video_grid_thw"] = video_grid_thw
                     rope_kwargs["second_per_grid_ts"] = second_per_grid_ts
-                _debug_dump_rope_inputs(
-                    f"ttt idx={idx}", rope_kwargs, self.target_model.model
-                )
-                _reconcile_image_grids(rope_kwargs, self.target_model.model)
-                _ensure_nonempty_rope_rows(rope_kwargs)
+                _assert_no_empty_rope_rows(rope_kwargs)
                 position_ids, rope_deltas = self.target_model.model.get_rope_index(
                     **rope_kwargs
                 )
