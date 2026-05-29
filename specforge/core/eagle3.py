@@ -96,6 +96,57 @@ def _debug_dump_rope_inputs(label, kwargs, model, max_dumps: int = 4):
     print("\n".join(lines), flush=True)
 
 
+def _reconcile_image_grids(kwargs, model):
+    """Drop image_grid_thw entries with no matching live image-token segment.
+
+    transformers >=5.6 get_rope_index consumes image_grid_thw via a single global
+    iterator over image segments (runs of mm_token_type_ids==image, after
+    attention_mask filtering). The reve use_dummy_input_ids collate prepends a phantom
+    "image" (grid (1,2,2)) whose placeholder is not a live image_token_id in the
+    masked sequence, so its grid has no segment and desyncs the iterator -- the next
+    real image pulls the dummy grid and the position count mismatches the token count.
+    Keep only grids whose implied vision-token count matches the next live image
+    segment, in row order; drop orphans (the dummy). No-op on transformers that don't
+    use mm_token_type_ids (kwargs lacks it) or when nothing is dropped. Video grids are
+    left untouched (this data is image-only).
+    """
+    igt = kwargs.get("image_grid_thw")
+    mmtt = kwargs.get("mm_token_type_ids")
+    if igt is None or mmtt is None or igt.shape[0] == 0:
+        return
+    merge = getattr(
+        getattr(model.config, "vision_config", None), "spatial_merge_size", None
+    )
+    if not merge:
+        return
+    attn = kwargs.get("attention_mask")
+    seg_lens = []
+    for b in range(mmtt.shape[0]):
+        tt = mmtt[b]
+        if attn is not None:
+            tt = tt[attn[b].bool()]
+        tt = tt.tolist()
+        i, n = 0, len(tt)
+        while i < n:
+            if tt[i] == 1:
+                j = i
+                while j < n and tt[j] == 1:
+                    j += 1
+                seg_lens.append(j - i)
+                i = j
+            else:
+                i += 1
+    keep, seg_i = [], 0
+    for gi, g in enumerate(igt.tolist()):
+        implied = g[0] * (g[1] // merge) * (g[2] // merge)
+        if seg_i < len(seg_lens) and seg_lens[seg_i] == implied:
+            keep.append(gi)
+            seg_i += 1
+    if len(keep) != igt.shape[0]:
+        idx = torch.tensor(keep, dtype=torch.long, device=igt.device)
+        kwargs["image_grid_thw"] = igt[idx] if keep else igt[:0]
+
+
 class Eagle3Model(nn.Module):
     pass
 
@@ -635,6 +686,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 get_rope_kwargs["video_grid_thw"] = video_grid_thw
                 get_rope_kwargs["second_per_grid_ts"] = second_per_grid_ts
             _debug_dump_rope_inputs("setup", get_rope_kwargs, self.target_model.model)
+            _reconcile_image_grids(get_rope_kwargs, self.target_model.model)
             position_ids, rope_deltas = self.target_model.model.get_rope_index(
                 **get_rope_kwargs
             )
@@ -786,6 +838,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 _debug_dump_rope_inputs(
                     f"ttt idx={idx}", rope_kwargs, self.target_model.model
                 )
+                _reconcile_image_grids(rope_kwargs, self.target_model.model)
                 position_ids, rope_deltas = self.target_model.model.get_rope_index(
                     **rope_kwargs
                 )
