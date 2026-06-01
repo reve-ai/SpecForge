@@ -26,6 +26,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from transformers.cache_utils import DynamicCache
 from yunchang import EXTRACT_FUNC_DICT
 
@@ -287,12 +288,17 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         length: int = 7,
         attention_backend: str = "sdpa",
         target_model_type: Optional[str] = None,
+        ttt_checkpointing: bool = False,
     ):
         """
         Args:
             target_model: the target model to extract hidden states.
             draft_model: the draft model to be trained.
             length: TTT length, it means how many turns to unroll during TTT.
+            ttt_checkpointing: when True, recompute each TTT step's
+                backbone+logits+loss in backward (activation checkpointing) so the
+                per-step activation pile does not accumulate across the unroll.
+                Exact gradients. Only supported with the flex_attention backend.
         """
         super().__init__()
         self.target_model = target_model
@@ -300,6 +306,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         self.processor = processor
         self.length = length
         self.attention_backend = attention_backend
+        self.ttt_checkpointing = ttt_checkpointing
         if target_model_type is not None:
             model_type = target_model_type
         else:
@@ -643,6 +650,23 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         else:
             raise ValueError(f"Unknown attention backend: {self.attention_backend}")
 
+        if self.ttt_checkpointing:
+            return self._run_ttt_checkpointed(
+                target_p_padded=target_p_padded,
+                position_mask=position_mask,
+                loss_mask=loss_mask,
+                hidden_states=hidden_states,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                full_attention_mask=full_attention_mask,
+                position_ids=position_ids,
+                seq_length=seq_length,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                second_per_grid_ts=second_per_grid_ts,
+                mm_token_type_ids=mm_token_type_ids,
+            )
+
         for idx in range(self.length):
             target_p = target_p_padded[:, idx : idx + seq_length, :].contiguous()
             is_last = idx == self.length - 1
@@ -755,6 +779,139 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 if rope_deltas is not None:
                     self.rope_deltas = rope_deltas
                 # Flex attention mask shirnking is handled inside attention module
+        return plosses, vlosses, acces
+
+    def _run_ttt_checkpointed(
+        self,
+        target_p_padded,
+        position_mask,
+        loss_mask,
+        hidden_states,
+        input_ids,
+        attention_mask,
+        full_attention_mask,
+        position_ids,
+        seq_length,
+        image_grid_thw,
+        video_grid_thw,
+        second_per_grid_ts,
+        mm_token_type_ids,
+    ):
+        """Activation-checkpointed TTT unroll (flex_attention only).
+
+        Each step's backbone+logits+loss is recomputed in backward via
+        torch.utils.checkpoint, so the per-step activation pile (MLP
+        intermediates, draft logits, attention internals) is not held across the
+        whole unroll -- only one step is live at peak. Gradients are exact.
+
+        The KV cache is made FUNCTIONAL: instead of mutating one shared
+        DynamicCache across steps (which checkpoint would re-append to during
+        recompute -> corruption), each step rebuilds a fresh DynamicCache from the
+        accumulated K/V tensors carried as explicit checkpoint inputs/outputs.
+        """
+        assert (
+            self.attention_backend == "flex_attention"
+        ), "ttt_checkpointing is only supported with the flex_attention backend"
+        is_qwen3_vl = self.target_model_type in {"qwen3_vl", "qwen3_vl_moe"}
+
+        def _step(
+            input_ids_s,
+            hidden_states_s,
+            attention_mask_s,
+            position_ids_s,
+            target_p_s,
+            position_mask_s,
+            loss_mask_s,
+            k_acc,
+            v_acc,
+        ):
+            past_key_values = DynamicCache()
+            if k_acc is not None:
+                past_key_values.update(k_acc, v_acc, 0)
+            inputs_embeds = self.draft_model.embed_input_ids(input_ids_s).to(
+                hidden_states_s.dtype
+            )
+            hidden_out = self.draft_model.backbone(
+                input_embeds=inputs_embeds,
+                hidden_states=hidden_states_s,
+                cache_hidden=None,
+                attention_mask=attention_mask_s,
+                position_ids=position_ids_s,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            logits = self.draft_model.compute_logits(hidden_out)
+            with torch.no_grad():
+                acc = _compute_metric_acc(
+                    logits=logits,
+                    target_p=target_p_s,
+                    position_mask=position_mask_s,
+                    loss_mask=loss_mask_s,
+                )
+            loss = LogSoftmaxLoss.apply(logits, target_p_s, position_mask_s)
+            new_k = past_key_values.layers[0].keys
+            new_v = past_key_values.layers[0].values
+            return loss, acc, hidden_out, new_k, new_v
+
+        plosses, vlosses, acces = [], [], []
+        k_acc = v_acc = None
+        for idx in range(self.length):
+            target_p = target_p_padded[:, idx : idx + seq_length, :].contiguous()
+            is_last = idx == self.length - 1
+
+            loss, acc, hidden_states, k_acc, v_acc = torch.utils.checkpoint.checkpoint(
+                _step,
+                input_ids,
+                hidden_states,
+                attention_mask,
+                position_ids,
+                target_p,
+                position_mask,
+                loss_mask,
+                k_acc,
+                v_acc,
+                use_reentrant=False,
+            )
+            acces.append(acc)
+            plosses.append(loss)
+
+            if is_last:
+                continue
+
+            # Advance to the next TTT step: left-shift the per-step tensors and
+            # refresh M-RoPE positions (flex/qwen3_vl bookkeeping, mirrors the
+            # non-checkpointed loop above).
+            input_ids = padding(input_ids, left=False)
+            position_mask = padding(position_mask, left=False)
+            loss_mask = padding(loss_mask, left=False)
+            if full_attention_mask is not None:
+                full_attention_mask = padding(full_attention_mask, left=False)
+            if attention_mask is not None and is_qwen3_vl:
+                attention_mask = padding(attention_mask, left=False)
+
+            next_attention_tensor = (
+                full_attention_mask
+                if full_attention_mask is not None
+                else (attention_mask if is_qwen3_vl else None)
+            )
+            rope_kwargs = {
+                "input_ids": input_ids,
+                "image_grid_thw": image_grid_thw,
+                "attention_mask": next_attention_tensor,
+                "video_grid_thw": video_grid_thw,
+            }
+            if is_qwen3_vl:
+                rope_kwargs.update(
+                    self._resolve_get_rope_kwargs(input_ids, mm_token_type_ids)
+                )
+            else:
+                rope_kwargs["second_per_grid_ts"] = second_per_grid_ts
+            _assert_no_empty_rope_rows(rope_kwargs)
+            position_ids, rope_deltas = self.target_model.model.get_rope_index(
+                **rope_kwargs
+            )
+            if rope_deltas is not None:
+                self.rope_deltas = rope_deltas
         return plosses, vlosses, acces
 
 
