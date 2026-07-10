@@ -199,3 +199,7 @@ wandb/
 
 # macOS
 .DS_Store
+
+# JetSpec: exclude stray venv + editor backups from the shared branch
+.jetspec-research/.venv/
+*.bak

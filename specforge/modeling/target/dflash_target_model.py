@@ -25,10 +25,11 @@ from .sglang_backend import SGLangRunner
 
 @dataclass
 class DFlashTargetOutput:
-    hidden_states: torch.Tensor  # [batch, seq_len, hidden_size]
+    hidden_states: torch.Tensor  # [batch, seq_len, hidden_size] (concatenated tapped layers)
     input_ids: torch.Tensor  # [batch, seq_len]
     attention_mask: torch.Tensor  # [batch, seq_len]
     loss_mask: torch.Tensor  # [batch, seq_len]
+    last_hidden_states: Optional[torch.Tensor] = None  # [batch, seq_len, H] final layer, for distill
 
 
 class DFlashTargetModel(ABC):
@@ -262,14 +263,40 @@ class HFDFlashTargetModel(DFlashTargetModel):
         **kwargs,
     ) -> "HFDFlashTargetModel":
 
-        target_model = AutoModelForCausalLM.from_pretrained(
-            pretrained_model_name_or_path,
-            torch_dtype=torch_dtype,
-            cache_dir=cache_dir,
-            output_hidden_states=True,
-            trust_remote_code=True,
-            **kwargs,
-        ).eval()
+        import os
+
+        # Target forward (hidden-state extraction) is the per-step bottleneck. We use sdpa
+        # with the cuDNN backend disabled (see train_dflash.py) → torch's built-in
+        # flash/mem-efficient kernels: robust and avoids the cuDNN fused-attention crash on
+        # long math/code sequences. NOTE: flash_attention_2/3 both crash here — transformers
+        # 5.6's flash_attention_forward does `s_aux.to(query.dtype)` but s_aux is None for
+        # Qwen3 (attention-sink feature), an upstream bug. FA remains opt-in for future/other
+        # models via SPECFORGE_TARGET_ATTN=flash_attention_3.
+        attn_impl = kwargs.pop(
+            "attn_implementation", os.environ.get("SPECFORGE_TARGET_ATTN", "sdpa")
+        )
+
+        def _load(impl):
+            return AutoModelForCausalLM.from_pretrained(
+                pretrained_model_name_or_path,
+                torch_dtype=torch_dtype,
+                cache_dir=cache_dir,
+                output_hidden_states=True,
+                trust_remote_code=True,
+                attn_implementation=impl,
+                **kwargs,
+            ).eval()
+
+        try:
+            target_model = _load(attn_impl)
+            print(f"[dflash target] attn_implementation={attn_impl}", flush=True)
+        except Exception as e:
+            print(
+                f"[dflash target] '{attn_impl}' failed ({type(e).__name__}: {str(e)[:120]}); "
+                "falling back to sdpa",
+                flush=True,
+            )
+            target_model = _load("sdpa")
 
         if device:
             target_model = target_model.to(device)
@@ -311,6 +338,7 @@ class HFDFlashTargetModel(DFlashTargetModel):
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
+            last_hidden_states=outputs.hidden_states[-1],  # final layer, for soft-label distill
         )
 
 

@@ -26,6 +26,7 @@ from specforge.core.dflash import OnlineDFlashModel
 from specforge.data import build_eagle3_dataset, prepare_dp_dataloaders
 from specforge.distributed import destroy_distributed, get_dp_group, init_distributed
 from specforge.modeling.draft.dflash import DFlashDraftModel
+from specforge.modeling.draft.jetspec import JetSpecDraftModel
 from specforge.modeling.target.dflash_target_model import (
     DFlashTargetModel,
     get_dflash_target_model,
@@ -64,6 +65,15 @@ def parse_args():
         choices=["eager", "sdpa", "flex_attention"],
         help="Attention backend for draft model.",
     )
+    model_group.add_argument(
+        "--head-type",
+        type=str,
+        default="auto",
+        choices=["auto", "bidirectional", "causal"],
+        help="Within-block attention pattern. 'bidirectional' = DFlash; 'causal' = "
+        "JetSpec (each in-block position attends only to earlier-or-equal offsets). "
+        "'auto' reads `head_type` from the draft config, defaulting to bidirectional.",
+    )
 
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
@@ -78,6 +88,29 @@ def parse_args():
     )
 
     training_group = parser.add_argument_group("training")
+    training_group.add_argument(
+        "--distill",
+        action="store_true",
+        help="Soft-label distillation: temperature-scaled KL to the frozen target's "
+        "next-token distribution (in addition to / instead of hard CE).",
+    )
+    training_group.add_argument("--distill-temp", type=float, default=1.0)
+    training_group.add_argument(
+        "--distill-alpha",
+        type=float,
+        default=0.0,
+        help="Weight on hard CE; total = alpha*CE + (1-alpha)*KL*T^2. 0.0 = pure soft label.",
+    )
+    training_group.add_argument(
+        "--anchor-mode",
+        type=str,
+        default="tiling",
+        choices=["tiling", "random"],
+        help="tiling = contiguous blocks (DFlash default); random = JetSpec-style random "
+        "anchor sampling. NOTE: random requires --attention-backend sdpa/eager (dense mask).",
+    )
+    training_group.add_argument("--num-anchors", type=int, default=128,
+                                help="Anchors sampled per example when --anchor-mode random.")
     training_group.add_argument("--num-epochs", type=int, default=3)
     training_group.add_argument("--batch-size", type=int, default=1)
     training_group.add_argument("--learning-rate", type=float, default=1e-4)
@@ -94,12 +127,28 @@ def parse_args():
     output_group.add_argument("--log-interval", type=int, default=50)
     output_group.add_argument("--eval-interval", type=int, default=1000)
     output_group.add_argument("--save-interval", type=int, default=1000)
+    output_group.add_argument(
+        "--gcs-checkpoint-dir",
+        type=str,
+        default=None,
+        help="If set (e.g. gs://bucket/prefix), upload each checkpoint to GCS right after "
+        "saving, then delete older LOCAL checkpoints so only the latest stays on disk. "
+        "Archives every checkpoint to GCS while keeping local disk bounded. Off by default.",
+    )
 
     tracker_group = parser.add_argument_group("tracker")
     TrackerArgs.add_args(tracker_group)
 
     dist_group = parser.add_argument_group("distributed")
     dist_group.add_argument("--dist-timeout", type=int, default=30)
+    dist_group.add_argument(
+        "--tp-size",
+        type=int,
+        default=1,
+        help="Tensor-parallel size for the target model (shards a target too big "
+        "to replicate per-GPU). dp_size = world_size // tp_size; the draft trains "
+        "FSDP over WORLD regardless.",
+    )
 
     # SGLang specific args
     sglang_group = parser.add_argument_group("sglang backend")
@@ -144,7 +193,12 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     draft_config._attn_implementation = args.attention_backend
     print_on_rank0(f"Using attention backend: {args.attention_backend}")
 
-    draft_model = DFlashDraftModel(draft_config).cuda().to(torch.bfloat16)
+    # Select the draft class from the config architecture: JetSpecDraftModel forces the
+    # causal head; DFlashDraftModel is the default (bidirectional unless head_type=causal).
+    _archs = getattr(draft_config, "architectures", None) or ["DFlashDraftModel"]
+    _draft_cls = JetSpecDraftModel if "JetSpecDraftModel" in _archs else DFlashDraftModel
+    print_on_rank0(f"Draft model class: {_draft_cls.__name__}")
+    draft_model = _draft_cls(draft_config).cuda().to(torch.bfloat16)
 
     # Set capture layers for target model based on draft model config
     target_model.set_capture_layers(draft_model.target_layer_ids)
@@ -268,6 +322,33 @@ def save_checkpoint(args, epoch, step, dflash_model, draft_model, optimizer):
 
             print_on_rank0(f"Saved checkpoint to {save_dir}")
 
+            # Upload to GCS (mirrors reve-ml-dflash's GCS checkpoint path): archive every
+            # checkpoint to GCS via fast parallel gsutil, then keep only the latest one
+            # locally so the output dir can't fill the disk. Local copies are deleted ONLY
+            # after a verified-successful upload — a failed upload keeps the local copy.
+            gcs_dir = getattr(args, "gcs_checkpoint_dir", None)
+            if gcs_dir:
+                import glob as _glob
+                import subprocess as _sp
+
+                dest = gcs_dir.rstrip("/") + "/" + os.path.basename(save_dir)
+                rc = _sp.run(["gsutil", "-m", "rsync", "-r", save_dir, dest]).returncode
+                if rc == 0:
+                    print_on_rank0(f"Uploaded checkpoint to {dest}")
+                    for old in _glob.glob(
+                        os.path.join(args.output_dir, "epoch_*_step_*")
+                    ):
+                        if os.path.abspath(old) != os.path.abspath(save_dir):
+                            shutil.rmtree(old, ignore_errors=True)
+                            print_on_rank0(
+                                f"Removed local checkpoint {old} (archived in GCS)"
+                            )
+                else:
+                    print_on_rank0(
+                        f"WARNING: GCS upload failed (rc={rc}) for {save_dir}; "
+                        "keeping local copy"
+                    )
+
     dist.barrier()
 
 
@@ -315,7 +396,16 @@ def main():
     args = parse_args()
     set_seed(args.seed)
 
-    init_distributed(timeout=args.dist_timeout)
+    # Disable the cuDNN fused-attention SDPA backend. On Hopper it can throw
+    # "mha_graph.execute(...).is_good() == false" mid-training for certain sequence
+    # shapes (hit by the longer math/code sequences). Fall back to mem-efficient/flash
+    # SDPA, which are robust. Keeps the target-model forward working across all shapes.
+    try:
+        torch.backends.cuda.enable_cudnn_sdp(False)
+    except Exception:
+        pass
+
+    init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     print_with_rank("Initialized distributed")
 
     target_model, draft_model = build_models(args)
@@ -349,6 +439,16 @@ def main():
         device="cuda",
     )
 
+    # Resolve head_type: explicit flag wins; "auto" reads it from the draft config
+    # (e.g. configs/qwen3-8b-jetspec.json sets head_type="causal"), else bidirectional.
+    head_type = args.head_type
+    if head_type == "auto":
+        head_type = getattr(draft_model.config, "head_type", "bidirectional")
+    # Persist onto the draft config so saved checkpoints self-describe (inference
+    # then auto-detects the causal head without an explicit flag).
+    draft_model.config.head_type = head_type
+    print_on_rank0(f"DFlash head_type: {head_type}")
+
     dflash_model = OnlineDFlashModel(
         draft_model=draft_model,
         target_lm_head=target_components.lm_head,
@@ -356,7 +456,20 @@ def main():
         block_size=draft_model.block_size,
         mask_token_id=mask_token_id,
         attention_backend=args.attention_backend,
+        head_type=head_type,
     )
+    # Distillation config (set before FSDP wrap so it lives on the real module).
+    dflash_model.distill = args.distill
+    dflash_model.distill_temp = args.distill_temp
+    dflash_model.distill_alpha = args.distill_alpha
+    dflash_model.anchor_mode = args.anchor_mode
+    dflash_model.num_anchors = args.num_anchors
+    if args.distill:
+        print_on_rank0(
+            f"Soft-label distillation ON (temp={args.distill_temp}, alpha={args.distill_alpha})"
+        )
+    print_on_rank0(f"Anchor mode: {args.anchor_mode}" + (
+        f" (num_anchors={args.num_anchors})" if args.anchor_mode == "random" else ""))
 
     dflash_model = FSDP(
         dflash_model,
@@ -408,6 +521,9 @@ def main():
                 input_ids, attention_mask, loss_mask
             )
             hidden_states = target_output.hidden_states.cuda()  # Ensure on GPU
+            target_last_hidden = None
+            if args.distill and target_output.last_hidden_states is not None:
+                target_last_hidden = target_output.last_hidden_states.cuda()
 
             # Forward pass (Parallel Training)
             loss, accuracy = dflash_model(
@@ -415,6 +531,7 @@ def main():
                 attention_mask=attention_mask,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
+                target_last_hidden=target_last_hidden,
             )
 
             (loss / args.accumulation_steps).backward()

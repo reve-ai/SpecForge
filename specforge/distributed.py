@@ -120,15 +120,24 @@ def init_distributed(
     _DP_DEVICE_MESH = dist.DeviceMesh.from_group(dp_group, device_type="cuda")
 
 
+def _safe_destroy(pg):
+    """Destroy a process group, tolerating groups that were never created (e.g. the
+    sequence-parallel groups when sp_size==1). Without this, destroy_process_group raises
+    'Invalid process group specified' during teardown, giving a non-zero exit on an
+    otherwise-successful run (which a Ray/multi-node launcher flags as a failure)."""
+    if pg is None:
+        return
+    try:
+        dist.destroy_process_group(pg)
+    except (ValueError, RuntimeError):
+        pass
+
+
 def destroy_distributed():
     global _TP_GROUP, _DP_GROUP, _SP_ULYSSES_GROUP, _SP_RING_GROUP, _DRAFT_DP_GROUP
-    dist.destroy_process_group(_TP_GROUP)
-    dist.destroy_process_group(_DP_GROUP)
-    dist.destroy_process_group(_SP_ULYSSES_GROUP)
-    dist.destroy_process_group(_SP_RING_GROUP)
-    dist.destroy_process_group(_DRAFT_DP_GROUP)
-    dist.destroy_process_group(_DRAFT_SP_GROUP)
-    dist.destroy_process_group()
+    for pg in (_TP_GROUP, _DP_GROUP, _SP_ULYSSES_GROUP, _SP_RING_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP):
+        _safe_destroy(pg)
+    dist.destroy_process_group()  # the default (WORLD) group
 
 
 def shard_tensor(

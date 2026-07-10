@@ -39,6 +39,39 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
+def _to_additive_attention_mask(attention_mask, *, query_dtype, device, key_len):
+    """Coerce a bool/additive mask to an additive float mask sliced to key_len."""
+    if attention_mask.ndim == 4:
+        attention_mask = attention_mask[:, :, :, :key_len]
+    if attention_mask.dtype == torch.bool:
+        additive_mask = torch.zeros_like(attention_mask, dtype=query_dtype, device=device)
+        return additive_mask.masked_fill(
+            attention_mask.logical_not().to(device=device),
+            torch.finfo(query_dtype).min,
+        )
+    return attention_mask.to(device=device, dtype=query_dtype)
+
+
+def _build_dflash_causal_attention_mask(*, query, key, cached_kv_len, ctx_len):
+    """Inference-time JetSpec mask over the [ctx ; cached_noise ; new_noise] KV.
+
+    A noise query at absolute position p (= cached_kv_len + ctx_len + i) attends to
+    every key at position <= p: i.e. all context features (positions [0, ctx_len)) and
+    all earlier-or-equal noise positions. This is the KV-cache counterpart of the
+    block-causal training mask — context is fully visible (it is the realized prefix)
+    and within-block attention is causal.
+    """
+    q_len = query.shape[-2]
+    kv_len = key.shape[-2]
+    key_positions = torch.arange(kv_len, device=query.device)
+    query_positions = cached_kv_len + ctx_len + torch.arange(q_len, device=query.device)
+    can_attend = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+    mask = torch.zeros((1, 1, q_len, kv_len), dtype=query.dtype, device=query.device)
+    return mask.masked_fill(
+        can_attend.logical_not().unsqueeze(0).unsqueeze(0), torch.finfo(query.dtype).min
+    )
+
+
 class Qwen3DFlashAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -54,7 +87,14 @@ class Qwen3DFlashAttention(nn.Module):
         )
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
-        self.is_causal = False
+        # JetSpec causal head: read from config so a loaded checkpoint self-describes.
+        # Supports both a top-level `head_type="causal"` and the upstream-style
+        # `dflash_config={"causal_head": True}`. Default False == DFlash (bidirectional).
+        dflash_cfg = getattr(config, "dflash_config", {}) or {}
+        self.is_causal = (
+            getattr(config, "head_type", None) == "causal"
+            or bool(dflash_cfg.get("causal_head", False))
+        )
         self.q_proj = nn.Linear(
             config.hidden_size,
             config.num_attention_heads * self.head_dim,
@@ -95,6 +135,12 @@ class Qwen3DFlashAttention(nn.Module):
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         bsz, q_len = hidden_states.shape[:-1]
         ctx_len = target_hidden.shape[1]
+        # Caller may force a head type per-call (is_causal kwarg, used by spec_generate);
+        # else fall back to the config-derived default. `is_causal_arg is None` means the
+        # caller did not pass it — the training path (flex_attention) never does, and we
+        # must NOT inject it there (training causality lives in the BlockMask, not here).
+        is_causal_arg = kwargs.pop("is_causal", None)
+        is_causal = self.is_causal if is_causal_arg is None else is_causal_arg
         q = self.q_proj(hidden_states)
         q = q.view(bsz, q_len, -1, self.head_dim)
         q = self.q_norm(q).transpose(1, 2)
@@ -112,9 +158,41 @@ class Qwen3DFlashAttention(nn.Module):
         v = v.transpose(1, 2)
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        # Query THIS layer's own cached length (DynamicCache.get_seq_length defaults to
+        # layer 0, which is already updated by the time layers 1..N run — using it would
+        # produce a non-causal mask at those layers on the first spec step). Read before
+        # the cache update so it reflects only the prefix already present.
+        cached_kv_len = (
+            past_key_values.get_seq_length(self.layer_idx)
+            if past_key_values is not None
+            else 0
+        )
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
+
+        attn_backend = self.config._attn_implementation
+        if bool(is_causal) and attn_backend in {"eager", "sdpa"}:
+            # JetSpec inference: build the explicit block-causal additive mask (context
+            # fully visible, within-block causal) and fold in any incoming mask. The mask
+            # carries causality, so is_causal is handed to the kernel as False.
+            dflash_causal_mask = _build_dflash_causal_attention_mask(
+                query=q, key=k, cached_kv_len=cached_kv_len, ctx_len=ctx_len
+            )
+            if attention_mask is not None:
+                dflash_causal_mask = dflash_causal_mask + _to_additive_attention_mask(
+                    attention_mask,
+                    query_dtype=q.dtype,
+                    device=q.device,
+                    key_len=k.shape[-2],
+                )
+            attention_mask = dflash_causal_mask
+            kwargs["is_causal"] = False
+        elif is_causal_arg is not None:
+            # Preserve the original inference behavior (e.g. bidirectional spec_generate
+            # passes is_causal=False). Training (flex) passes nothing → kwargs untouched.
+            kwargs["is_causal"] = is_causal_arg
+
         attn_fn: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
@@ -234,6 +312,12 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         )
         self.hidden_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.block_size = config.block_size
+        # JetSpec causal head flag (default False == DFlash). Drives the inference mask.
+        dflash_cfg = getattr(config, "dflash_config", {}) or {}
+        self.causal_head = (
+            getattr(config, "head_type", None) == "causal"
+            or bool(dflash_cfg.get("causal_head", False))
+        )
         self.post_init()
 
     def forward(
@@ -271,6 +355,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         max_new_tokens: int,
         stop_token_ids: list[int],
         temperature: float,
+        return_acceptance: bool = False,
     ):
         self.eval()
         target.eval()
@@ -325,7 +410,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                     ],
                     past_key_values=past_key_values_draft,
                     use_cache=True,
-                    is_causal=False,
+                    is_causal=self.causal_head,
                 )[:, -block_size + 1 :, :]
             )
             past_key_values_draft.crop(start)
@@ -375,4 +460,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                     :, : num_input_tokens + stop_token_indices[0] + 1
                 ]
 
+        if return_acceptance:
+            # acceptance_lengths[i] = tokens committed at verify step i (>=1). Mean over
+            # steps == total committed / num verify forwards == the serving accept_len.
+            return output_ids, acceptance_lengths
         return output_ids

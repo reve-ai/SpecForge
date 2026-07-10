@@ -56,6 +56,11 @@ def parse_arguments():
         action="store_true",
         help="Whether the model is a GPT-OSS model",
     )
+    model_group.add_argument(
+        "--no-think",
+        action="store_true",
+        help="Disable Qwen3 thinking (sends chat_template_kwargs.enable_thinking=False)",
+    )
 
     # sampling params
     sampling_params_group = parser.add_argument_group("sampling parameters")
@@ -175,6 +180,8 @@ def build_query_kwargs(args, messages, max_tokens=None):
     extra_body = {}
     if args.top_k is not None:
         extra_body["top_k"] = args.top_k
+    if args.no_think:
+        extra_body["chat_template_kwargs"] = {"enable_thinking": False}
     if extra_body:
         query_kwargs["extra_body"] = extra_body
     if args.is_gpt_oss:
